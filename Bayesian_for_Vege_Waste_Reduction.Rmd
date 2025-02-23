@@ -1,0 +1,165 @@
+---
+title: "Bayesian_for_Vege_Waste_Reduction"
+author: "yoojungslee"
+date: "2024-09-23"
+output: html_document
+---
+
+```{r}
+install.packages("dplyr")
+install.packages("rstan")
+install.packages("ggplot2")
+install.packages("tidyr")
+library(dplyr)
+library(rstan)
+library(ggplot2)
+library(tidyr)
+options(mc.cores = parallel::detectCores())
+```
+# 1. Data Input
+```{r}
+write.csv(data.frame(
+  Grade = rep(1:6, each = 4),
+  Week = rep(1:4, times = 6),
+  Waste_Percentage = c(
+    30, 15, 7, 7,      25, 18, 14, 9,    19, 15, 10, 5, 
+    24, 18, 14, 13,   27, 23, 20, 25,   38, 22, 18, 15
+  )
+), "vegetable_waste_data.csv", row.names = FALSE)
+
+data <- read.csv("vegetable_waste_data.csv")
+data <- data %>% mutate(Waste = Waste_Percentage / 100)
+```
+# 2. Prior Probability Estimation
+```{r}
+prior_data <- data %>%
+  group_by(Grade) %>%
+  summarise(
+    mean_waste = mean(Waste),
+    var_waste = var(Waste),
+    alpha_prior = mean_waste * ((mean_waste * (1 - mean_waste)) / var_waste - 1),
+    beta_prior = (1 - mean_waste) * ((mean_waste * (1 - mean_waste)) / var_waste - 1)
+  ) 
+print(prior_data)
+```
+# 3. Define and Run Bayesian Model in Stan
+```{r}
+# Preparing Explanatory Variables
+X <- model.matrix(~ Grade + Week, data = data)  # Use Grade and Week as explanatory variables
+stan_data <- list(
+  N = nrow(data),
+  num_of_grades = length(prior_data$Grade),
+  K = ncol(X),
+  X = X,
+  wa = data$Waste,
+  s_alpha_prior = pmax(prior_data$alpha_prior, 0.1),
+  s_beta_prior = pmax(prior_data$beta_prior, 0.1)
+)
+```
+
+```{r}
+# (4) Define and Execute Stan Model
+stan_model_code <- "
+  data {
+    int<lower=0> N;
+    int<lower=0> num_of_grades;
+    int<lower=0> K;
+    matrix[N, K] X;    
+    real<lower=0, upper=1> wa[N];
+    real<lower=0> s_alpha_prior[num_of_grades];
+    real<lower=0> s_beta_prior[num_of_grades];
+  }
+  parameters {
+    vector[K] beta;
+    real<lower=0> phi;
+  }
+  transformed parameters {
+    vector[N] waste_prob;
+    waste_prob = inv_logit(-X * beta);
+  }
+  model {
+    beta ~ normal(0, 10);
+    phi ~ gamma(1, 0.1);
+    wa ~ beta(waste_prob * phi, (1 - waste_prob) * phi);
+  }
+  generated quantities {
+    real<lower=0, upper=1> wa_pred[N];
+    for (n in 1:N) {
+      wa_pred[n] = beta_rng(waste_prob[n] * phi, (1 - waste_prob[n]) * phi);
+    }
+  }
+"
+
+model <- stan_model(model_code = stan_model_code)
+fit <- sampling(model, data = stan_data, iter = 2000, chains = 4)
+print(fit)
+```
+# 4. Extract and prosess Posterior Predictions
+```{r}
+posterior <- rstan::extract(fit)
+waste_prob <- colMeans(posterior$waste_prob)  # Mean predicted probability for each observation
+wa_pred <- colMeans(posterior$wa_pred)        # Mean sampled predicted values for each observation
+
+# Add predictions to the dataframe
+results_df <- data %>%
+  mutate(
+    Predicted_Waste_Prob = waste_prob,
+    Predicted_Waste = wa_pred
+  )
+
+print(results_df)
+```
+
+# 5. Visualization
+## (1) Change Over Weeks (Mean Predicted Values)
+```{r}
+ggplot(results_df, aes(x = Week)) +
+  geom_point(aes(y = Waste, color = "Observed"), alpha = 0.5) +
+  geom_point(aes(y = Predicted_Waste, color = "Predicted"), alpha = 0.5) +
+  stat_summary(aes(y = Waste), fun = mean, geom = "line", group = 1, color = "blue", linetype = "dashed") +
+  stat_summary(aes(y = Predicted_Waste), fun = mean, geom = "line", group = 1, color = "red") +
+  labs(x = "Week", y = "Waste Probability", 
+       title = "Observed vs Predicted Vegetable Waste by Week",
+       color = "Type") +
+  theme_minimal()
+```
+## (2) Separate Graphs for Each Grade
+```{r}
+## (2-1) Prepare Data (Convert to Long Format)
+plot_df <- results_df %>%
+  select(Grade, Week, Waste, Predicted_Waste) %>%
+  pivot_longer(cols = c(Waste, Predicted_Waste), 
+               names_to = "Type", values_to = "Value") %>%
+  mutate(Type = factor(Type, levels = c("Waste", "Predicted_Waste"), 
+                       labels = c("Observed", "Predicted")))
+
+## (2-2) Visualization
+ggplot(plot_df, aes(x = Week, y = Value, color = Type)) +
+  geom_point(alpha = 0.7, size = 2) +  # Individual observations and predictions
+  stat_summary(fun = mean, geom = "line", aes(group = Type), linewidth = 1) +  # Mean trend line
+  facet_wrap(~ Grade, ncol = 3, labeller = labeller(Grade = paste0("Grade ", 1:6))) +  # Separate by grade
+  scale_color_manual(values = c("Observed" = "blue", "Predicted" = "red")) +
+  labs(x = "Week", y = "Waste Probability", 
+       title = "Observed vs Predicted Waste Probability by Grade",
+       color = "Type") +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+## (3) Compare Observed vs Predicted Values (Mean by Grade)
+```{r}
+ggplot(results_df, aes(x = factor(Grade))) +
+  geom_point(aes(y = Waste, color = "Observed"), size = 3, alpha = 0.5) +
+  geom_text(aes(y = Waste, label = Week), color = "blue", size = 3, 
+            nudge_x = 0.1, nudge_y = 0.01, check_overlap = TRUE) +  # Add Week labels
+  geom_point(aes(y = Predicted_Waste, color = "Predicted"), size = 3, alpha = 0.5) +
+  stat_summary(aes(y = Waste), fun = mean, geom = "line", group = 1, 
+               color = "blue", linetype = "dashed") +
+  stat_summary(aes(y = Predicted_Waste), fun = mean, geom = "line", group = 1, 
+               color = "red") +
+  scale_color_manual(values = c("Observed" = "blue", "Predicted" = "red")) +
+  scale_x_discrete(labels = c("1st", "2nd", "3rd", "4th", "5th", "6th")) +  # Ordinal labels
+  labs(x = "Grade", y = "Waste Probability", 
+       title = "Observed vs Predicted Vegetable Waste by Grade",
+       color = "Type") +
+  theme_minimal()
+```
